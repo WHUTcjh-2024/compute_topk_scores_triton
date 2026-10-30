@@ -21,12 +21,12 @@ from vllm.v1.worker.gpu.buffer_utils import StagedWriteTensor, UvaBackedTensor
 # Upper bound on the topk kernel's per-iteration gather width.
 _MAX_TOPK_BLOCK = 1024
 
-# Elements scanned per iteration by the Top-K selector.
+# Minimum scan width; grow to KP for large K so block selection stays in bounds.
 _TOPK_BLOCK = 1024
 
 # Ordering sentinel: one below the packed key of (``-inf``, index 0).
 # Real keys are ``(monotonic_bits(logit) - 2**31) << 32 | index``.
-_KEY_SENTINEL = (-2139095041 << 32) - 1
+_KEY_SENTINEL = tl.constexpr((-2139095041 << 32) - 1)
 
 
 @triton.jit
@@ -37,6 +37,11 @@ def _order_key(logits, index):
     numeric comparison; the 32 index bits ride in the low half.
     """
     u = logits.to(tl.uint32, bitcast=True)
+    # Signed zeros compare equal. Canonicalize NaNs so either sign sorts
+    # above +inf, matching torch.topk's largest-value semantics.
+    magnitude = u & 0x7FFFFFFF
+    u = tl.where(magnitude == 0, 0, u)
+    u = tl.where(magnitude > 0x7F800000, 0x7FFFFFFF, u)
     folded = u ^ tl.where(u >> 31 != 0, 0xFFFFFFFF, 0x80000000)
     return ((folded.to(tl.int64) - 0x80000000) << 32) + index.to(tl.int64)
 
@@ -71,20 +76,22 @@ def _topk_ids_kernel(
     if TOPK > 0:
         k_off = tl.arange(0, KP)
         running = tl.full([KP], _KEY_SENTINEL, tl.int64)
+        threshold = tl.full((), _KEY_SENTINEL, tl.int64)
 
         full = (vocab_size // BLOCK) * BLOCK
         for i in tl.range(0, full, BLOCK):
             block = i + tl.arange(0, BLOCK)
             keys = _order_key(tl.load(row_ptr + block).to(tl.float32), block)
-            if tl.max(keys) >= tl.min(running):
-                block_top = tl.gather(
-                    tl.sort(keys, descending=True), k_off, 0
-                )
-                merged = tl.reshape(
-                    tl.join(running, block_top), [2 * KP]
-                )
-                merged = tl.sort(merged, descending=True)
-                running = tl.gather(merged, k_off, 0)
+            block_max = tl.max(keys)
+            if block_max >= threshold:
+                if KP == 1:
+                    # Triton 3.7.1 topk(k=1) fails when reshaping a scalar.
+                    running = tl.maximum(running, block_max)
+                else:
+                    block_top = tl.topk(keys, KP)
+                    merged = tl.reshape(tl.join(running, block_top), [2 * KP])
+                    running = tl.topk(merged, KP)
+                threshold = tl.min(running)
 
         if full < vocab_size:
             block = full + tl.arange(0, BLOCK)
@@ -94,15 +101,14 @@ def _topk_ids_kernel(
                 block,
             )
             keys = tl.where(mask, keys, _KEY_SENTINEL)
-            if tl.max(keys) >= tl.min(running):
-                block_top = tl.gather(
-                    tl.sort(keys, descending=True), k_off, 0
-                )
-                merged = tl.reshape(
-                    tl.join(running, block_top), [2 * KP]
-                )
-                merged = tl.sort(merged, descending=True)
-                running = tl.gather(merged, k_off, 0)
+            block_max = tl.max(keys)
+            if block_max >= threshold:
+                if KP == 1:
+                    running = tl.maximum(running, block_max)
+                else:
+                    block_top = tl.topk(keys, KP)
+                    merged = tl.reshape(tl.join(running, block_top), [2 * KP])
+                    running = tl.topk(merged, KP)
 
         ids = running & 0xFFFFFFFF
         tl.store(
@@ -251,14 +257,13 @@ def _mask_scores_kernel(
     in_range = cols < num_cols
 
     offset = req_idx * scores_stride + cols
-    values = tl.load(scores_ptr + offset, mask=in_range, other=0.0)
     valid = tl.load(
         mask_ptr + req_idx * mask_stride + cols, mask=in_range, other=0
     )
     tl.store(
         scores_ptr + offset,
-        tl.where(valid != 0, values, float("-inf")),
-        mask=in_range,
+        float("-inf"),
+        mask=in_range & (valid == 0),
     )
 
 
@@ -368,7 +373,7 @@ def compute_topk_scores(
                 vocab_size,
                 TOPK=num_logprobs,
                 WRITE_SAMPLED=True,
-                BLOCK=_TOPK_BLOCK,
+                BLOCK=max(_TOPK_BLOCK, triton.next_power_of_2(num_logprobs)),
                 KP=triton.next_power_of_2(num_logprobs),
             )
         if logits_mode:
@@ -386,7 +391,9 @@ def compute_topk_scores(
         if num_logprobs > 0:
             topk_token_ids = torch.empty(
                 (batch_size, num_logprobs),
-                dtype=torch.int64,
+                # Match upstream and the custom-token buffer: the fill
+                # kernel's dynamic source-pointer branches must agree.
+                dtype=torch.int32,
                 device=logits.device,
             )
             _topk_ids_kernel[(batch_size,)](
@@ -398,8 +405,8 @@ def compute_topk_scores(
                 vocab_size,
                 TOPK=num_logprobs,
                 WRITE_SAMPLED=False,
-                BLOCK=_TOPK_BLOCK,
-                KP=max(triton.next_power_of_2(num_logprobs), 1),
+                BLOCK=max(_TOPK_BLOCK, triton.next_power_of_2(num_logprobs)),
+                KP=triton.next_power_of_2(num_logprobs),
             )
         else:
             # This tensor just used as an int32 pointer, data not accessed.
@@ -497,12 +504,12 @@ def _fill_logprob_token_ids_kernel(
     in_range = col < NUM_COLS
     tl.store(
         out_token_ids_ptr + batch_idx * out_token_ids_stride + 1 + col,
-        tl.where(valid, tokens, 0),
+        tokens,
         mask=in_range,
     )
     tl.store(
         out_valid_mask_ptr + batch_idx * out_valid_mask_stride + 1 + col,
-        tl.where(valid, 1, 0).to(tl.int1),
+        valid,
         mask=in_range,
     )
 
